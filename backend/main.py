@@ -1,92 +1,72 @@
-# -*- coding: utf-8 -*-
-"""
-🦉 猫头鹰工厂 - 后台管理系统主应用
-基于FastAPI + Supabase的完整后端解决方案
-"""
-
-import uvicorn
-from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
+import logging
+import time
 from datetime import datetime
-from loguru import logger
-import sys
+
+# 导入路由
+from .api import auth_routes, user_routes, task_routes, gpu_routes, recharge_routes, admin_routes
+from .config.supabase_config import get_supabase_manager
+from .models.database_models import APIResponse
 
 # 配置日志
-logger.remove()
-logger.add(
-    sys.stdout,
-    format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
-    level="INFO"
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('owl_workshop.log'),
+        logging.StreamHandler()
+    ]
 )
-logger.add(
-    "logs/app.log",
-    format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
-    level="INFO",
-    rotation="1 day",
-    retention="30 days"
-)
-
-# 导入配置和服务
-from config.supabase_config import settings, supabase_manager
-from services.recharge_service import recharge_service
-from services.gpu_monitor_service import gpu_monitor_service
-
-# 导入API路由
-from api.auth_routes import router as auth_router
-from api.user_routes import router as user_router
-from api.recharge_routes import router as recharge_router
-from api.gpu_routes import router as gpu_router
-from api.admin_routes import router as admin_router
-from api.log_routes import router as log_router
-
-# 导入Supabase认证中间件
-from middleware.supabase_auth import get_current_user, get_admin_user
+logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """应用生命周期管理"""
+    """
+    应用生命周期管理
+    """
     # 启动时执行
-    logger.info("🚀 猫头鹰工厂后台管理系统启动中...")
+    logger.info("猫头鹰工厂后端服务启动中...")
     
     try:
-        # 测试Supabase连接
-        if supabase_manager.test_connection():
-            logger.info("✅ Supabase连接测试成功")
-        else:
-            logger.warning("⚠️ Supabase连接测试失败")
+        # 初始化Supabase连接
+        supabase_manager = get_supabase_manager()
+        supabase = supabase_manager.get_client()
         
-        # 同步GPU服务器配置
-        sync_result = await gpu_monitor_service.sync_gpu_servers_to_database()
-        if sync_result["success"]:
-            logger.info(f"✅ GPU服务器配置同步成功: {sync_result['message']}")
-        else:
-            logger.warning(f"⚠️ GPU服务器配置同步失败: {sync_result['message']}")
+        # 测试数据库连接
+        test_result = supabase.table('users').select('id').limit(1).execute()
+        logger.info("数据库连接测试成功")
         
-        logger.info("🎉 系统启动完成")
+        # 这里可以添加其他初始化逻辑
+        # 例如：启动任务调度器、初始化缓存等
+        
+        logger.info("猫头鹰工厂后端服务启动完成")
         
     except Exception as e:
-        logger.error(f"❌ 系统启动失败: {e}")
+        logger.error(f"服务启动失败: {str(e)}")
+        raise
     
     yield
     
     # 关闭时执行
-    logger.info("👋 猫头鹰工厂后台管理系统关闭")
+    logger.info("猫头鹰工厂后端服务关闭中...")
+    # 这里可以添加清理逻辑
+    logger.info("猫头鹰工厂后端服务已关闭")
 
 # 创建FastAPI应用
 app = FastAPI(
-    title="猫头鹰工厂后台管理系统",
-    description="基于Supabase的完整后端管理解决方案",
+    title="猫头鹰工厂 API",
+    description="猫头鹰工厂GPU集群管理系统后端API",
     version="0.10.0",
     docs_url="/docs",
     redoc_url="/redoc",
     lifespan=lifespan
 )
 
-# 添加CORS中间件
+# 配置CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -94,110 +74,161 @@ app.add_middleware(
         "http://localhost:5173",
         "http://127.0.0.1:3000",
         "http://127.0.0.1:5173",
-        "https://your-frontend-domain.com"  # 生产环境域名
+        # 生产环境域名
+        "https://owl-workshop.example.com"
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# 添加可信主机中间件
+# 配置受信任主机
 app.add_middleware(
     TrustedHostMiddleware,
-    allowed_hosts=["localhost", "127.0.0.1", "*.your-domain.com"]
+    allowed_hosts=[
+        "localhost",
+        "127.0.0.1",
+        "*.example.com",  # 生产环境域名
+    ]
 )
 
-# 全局异常处理
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request, exc):
-    """HTTP异常处理"""
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={
-            "success": False,
-            "message": exc.detail,
-            "status_code": exc.status_code
-        }
-    )
+# 请求日志中间件
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start_time = time.time()
+    
+    # 记录请求信息
+    logger.info(f"请求开始: {request.method} {request.url}")
+    
+    response = await call_next(request)
+    
+    # 计算处理时间
+    process_time = time.time() - start_time
+    
+    # 记录响应信息
+    logger.info(f"请求完成: {request.method} {request.url} - 状态码: {response.status_code} - 耗时: {process_time:.3f}s")
+    
+    # 添加响应头
+    response.headers["X-Process-Time"] = str(process_time)
+    
+    return response
 
+# 全局异常处理
 @app.exception_handler(Exception)
-async def general_exception_handler(request, exc):
-    """通用异常处理"""
-    logger.error(f"❌ 未处理的异常: {exc}")
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.error(f"未处理的异常: {str(exc)}", exc_info=True)
+    
     return JSONResponse(
         status_code=500,
-        content={
-            "success": False,
-            "message": "服务器内部错误",
-            "status_code": 500
+        content=APIResponse(
+            success=False,
+            message="服务器内部错误",
+            error="INTERNAL_SERVER_ERROR"
+        ).dict()
+    )
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=APIResponse(
+            success=False,
+            message=exc.detail,
+            error=f"HTTP_{exc.status_code}"
+        ).dict()
+    )
+
+# 注册路由
+app.include_router(auth_routes.router, prefix="/api")
+app.include_router(user_routes.router, prefix="/api")
+app.include_router(task_routes.router, prefix="/api")
+app.include_router(gpu_routes.router, prefix="/api")
+app.include_router(recharge_routes.router, prefix="/api")
+app.include_router(admin_routes.router, prefix="/api")
+
+# 根路径
+@app.get("/", response_model=APIResponse)
+async def root():
+    return APIResponse(
+        success=True,
+        message="欢迎使用猫头鹰工厂API",
+        data={
+            "name": "猫头鹰工厂",
+            "version": "0.10.0",
+            "description": "GPU集群管理系统",
+            "docs": "/docs",
+            "redoc": "/redoc"
         }
     )
 
-# 根路由
-@app.get("/")
-async def root():
-    """根路径"""
-    return {
-        "message": "🦉 猫头鹰工厂后台管理系统",
-        "version": "0.10.0",
-        "status": "running",
-        "docs": "/docs"
-    }
-
 # 健康检查
-@app.get("/health")
+@app.get("/health", response_model=APIResponse)
 async def health_check():
-    """健康检查"""
     try:
-        # 测试Supabase连接
-        supabase_status = supabase_manager.test_connection()
+        # 检查数据库连接
+        supabase_manager = get_supabase_manager()
+        supabase = supabase_manager.get_client()
         
-        return {
-            "status": "healthy",
-            "timestamp": str(datetime.utcnow()),
-            "services": {
-                "supabase": "connected" if supabase_status else "disconnected",
-                "api": "running"
-            }
-        }
-    except Exception as e:
-        logger.error(f"❌ 健康检查失败: {e}")
-        return JSONResponse(
-            status_code=503,
-            content={
-                "status": "unhealthy",
-                "error": str(e)
+        # 简单的数据库查询测试
+        test_result = supabase.table('users').select('id').limit(1).execute()
+        
+        return APIResponse(
+            success=True,
+            message="服务健康",
+            data={
+                "status": "healthy",
+                "timestamp": datetime.utcnow().isoformat(),
+                "database": "connected"
             }
         )
+        
+    except Exception as e:
+        logger.error(f"健康检查失败: {str(e)}")
+        return JSONResponse(
+            status_code=503,
+            content=APIResponse(
+                success=False,
+                message="服务不健康",
+                data={
+                    "status": "unhealthy",
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "error": str(e)
+                }
+            ).dict()
+        )
 
-# 系统信息
-@app.get("/info")
-async def system_info():
-    """系统信息"""
-    return {
-        "app_name": settings.app_name,
-        "app_version": settings.app_version,
-        "debug": settings.debug,
-        "environment": "development" if settings.debug else "production"
-    }
-
-# 注册API路由
-app.include_router(auth_router, prefix="/api/auth", tags=["认证"])
-app.include_router(user_router, prefix="/api/users", tags=["用户管理"])
-app.include_router(recharge_router, prefix="/api/recharge", tags=["充值管理"])
-app.include_router(gpu_router, prefix="/api/gpu", tags=["GPU监控"])
-app.include_router(admin_router, prefix="/api/admin", tags=["系统管理"])
-app.include_router(log_router, prefix="/api/logs", tags=["日志管理"])
-
-# 导出依赖函数供路由使用
-__all__ = ["app", "get_current_user", "get_admin_user"]
+# API信息
+@app.get("/api/info", response_model=APIResponse)
+async def api_info():
+    return APIResponse(
+        success=True,
+        message="API信息",
+        data={
+            "name": "猫头鹰工厂 API",
+            "version": "0.10.0",
+            "description": "GPU集群管理系统后端API",
+            "endpoints": {
+                "auth": "/api/auth",
+                "users": "/api/users",
+                "tasks": "/api/tasks",
+                "gpu": "/api/gpu",
+                "recharge": "/api/recharge",
+                "admin": "/api/admin"
+            },
+            "documentation": {
+                "swagger": "/docs",
+                "redoc": "/redoc"
+            }
+        }
+    )
 
 if __name__ == "__main__":
-    # 开发环境运行
+    import uvicorn
+    
     uvicorn.run(
         "main:app",
-        host=settings.host,
-        port=settings.port,
-        reload=settings.debug,
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
         log_level="info"
     )
